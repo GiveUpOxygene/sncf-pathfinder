@@ -13,3 +13,7 @@ Ce projet sera scindé en deux parties :
 
 
 ### Théorie des graphes
+
+- [ ] récupération des données de la sncf
+- [ ] structuration de la base de données
+- [ ] création d'un algorithme de pathfinding
