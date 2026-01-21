@@ -1,0 +1,10 @@
+psycopg2-binary
+python-dotenv
+pytorch
+transformers
+pandas
+numpy
+scikit-learn
+datasets
+sentencepiece
+accelerate>=0.26.0
