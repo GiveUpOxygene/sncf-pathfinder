@@ -2,6 +2,7 @@
 
 results/
 city_extraction_model/
+spacy_custom/output/
 
 
 # Github auto generated
