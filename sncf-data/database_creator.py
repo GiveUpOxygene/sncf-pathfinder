@@ -15,7 +15,7 @@ gares_csv_path = os.path.join(script_dir, "csv", "liste-des-gares.csv")
 tarifs_csv_path = os.path.join(script_dir, "csv", "tarifs-tgv-inoui-ouigo.csv")
 vitesse_csv_path = os.path.join(script_dir, "csv", "vitesse-maximale-nominale-sur-ligne.csv")
 
-def db_connect():
+def db_connect(dbname="sncf"):
     load_dotenv(os.path.join(script_dir, '../.env'))
 
     db_user = os.getenv("DB_USER")
@@ -29,16 +29,16 @@ def db_connect():
             password=db_password,
             host=db_host,
             port=db_port,
-            database="sncf"
+            database=dbname
         )
         return conn
     except psycopg2.Error as e:
-        print(f"Error connecting to database: {e}")
+        print(f"Error connecting to database '{dbname}': {e}")
         return None
 
 def create_database():
     print("Starting create_database...")
-    conn = db_connect()
+    conn = db_connect(dbname="postgres")
     if not conn:
         print("Failed to connect to database for create_database.")
         return
@@ -196,11 +196,15 @@ def create_lignes_table():
         conn.autocommit = True
         cur = conn.cursor()
 
+        cur.execute("DROP TABLE IF EXISTS lignes CASCADE;")
+        print("Dropped table 'lignes' if it existed.")
+
         create_table_query = """
         CREATE TABLE IF NOT EXISTS lignes (
             id SERIAL PRIMARY KEY,
             gare_origine_code_uic VARCHAR(10) NOT NULL,
-            gare_destination_code_uic VARCHAR(10) NOT NULL
+            gare_destination_code_uic VARCHAR(10) NOT NULL,
+            UNIQUE (gare_origine_code_uic, gare_destination_code_uic)
         )
         """
         cur.execute(create_table_query)
@@ -209,7 +213,7 @@ def create_lignes_table():
         insert_query = """
         INSERT INTO lignes (gare_origine_code_uic, gare_destination_code_uic)
         VALUES (%s, %s)
-        ON CONFLICT DO NOTHING;
+        ON CONFLICT (gare_origine_code_uic, gare_destination_code_uic) DO NOTHING;
         """
         
         inserted_count = 0
@@ -296,7 +300,8 @@ def create_troncons_table():
         create_table_query = f"""
         CREATE TABLE IF NOT EXISTS troncons (
             id SERIAL PRIMARY KEY,
-            {columns}
+            {columns},
+            UNIQUE (code_ligne, rg_troncon, pkd, pkf)
         )
         """
         
@@ -324,7 +329,11 @@ def create_troncons_table():
         
         placeholders = ", ".join(["%s"] * len(all_headers))
         column_names = ", ".join([f'"{header}"' for header in all_headers])
-        insert_query = f"INSERT INTO troncons ({column_names}) VALUES ({placeholders})"
+        insert_query = f"""
+        INSERT INTO troncons ({column_names})
+        VALUES ({placeholders})
+        ON CONFLICT (code_ligne, rg_troncon, pkd, pkf) DO NOTHING;
+        """
         
         inserted_count = 0
         for key, data_dict in merged_data.items():
