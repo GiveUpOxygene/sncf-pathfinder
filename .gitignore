@@ -3,6 +3,9 @@
 results/
 city_extraction_model/
 spacy_custom/output/
+spacy_custom/dev.spacy
+spacy_custom/train.spacy
+spacy_custom/config.cfg
 
 
 # Github auto generated
