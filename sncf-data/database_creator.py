@@ -5,11 +5,18 @@ import csv
 import json
 import math
 
+script_dir = os.path.dirname(__file__)
+
 # Increase CSV field size limit to handle large geo shape fields
 csv.field_size_limit(10000000)  # Set to 10MB
 
-def create_database():
-    load_dotenv('../.env')
+troncons_csv_path = os.path.join(script_dir, "csv", "lignes-par-type.csv")
+gares_csv_path = os.path.join(script_dir, "csv", "liste-des-gares.csv")
+tarifs_csv_path = os.path.join(script_dir, "csv", "tarifs-tgv-inoui-ouigo.csv")
+vitesse_csv_path = os.path.join(script_dir, "csv", "vitesse-maximale-nominale-sur-ligne.csv")
+
+def db_connect():
+    load_dotenv(os.path.join(script_dir, '../.env'))
 
     db_user = os.getenv("DB_USER")
     db_password = os.getenv("DB_PASSWORD")
@@ -22,8 +29,21 @@ def create_database():
             password=db_password,
             host=db_host,
             port=db_port,
-            database="postgres"
+            database="sncf"
         )
+        return conn
+    except psycopg2.Error as e:
+        print(f"Error connecting to database: {e}")
+        return None
+
+def create_database():
+    print("Starting create_database...")
+    conn = db_connect()
+    if not conn:
+        print("Failed to connect to database for create_database.")
+        return
+
+    try:
         conn.autocommit = True
         cur = conn.cursor()
 
@@ -38,22 +58,26 @@ def create_database():
 
         cur.close()
         conn.close()
+        print("Finished create_database.")
 
     except psycopg2.Error as e:
         print(f"Error connecting to or creating database: {e}")
 
 def create_gares_table():
-    load_dotenv('../.env')
-
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-
-    csv_path = "./csv/liste-des-gares.csv"
+    print("Starting create_gares_table...")
+    conn = db_connect()
+    if not conn:
+        print("Failed to connect to database for create_gares_table.")
+        return
 
     try:
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        cur.execute("DROP TABLE IF EXISTS gares CASCADE;")
+        print("Dropped table 'gares' if it existed.")
+
+        with open(gares_csv_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.reader(f, delimiter=';')
             headers = next(reader)
             data_rows = list(reader)
@@ -84,13 +108,17 @@ def create_gares_table():
             headers.pop(voyageurs_index)
             data_rows = [row[:voyageurs_index] + row[voyageurs_index+1:] for row in data_rows]
                 
-        conn = psycopg2.connect(
-            user=db_user,
-            password=db_password,
-            host=db_host,
-            port=db_port,
-            database="sncf"
-        )
+        column_defs_list = []
+        for header in headers:
+            if header == 'code_uic':
+                column_defs_list.append(f'"{header}" VARCHAR(10) UNIQUE')
+            else:
+                column_defs_list.append(f'"{header}" TEXT')
+        columns_def = ", ".join(column_defs_list)
+        
+        conn = db_connect()
+        if not conn:
+            return
         conn.autocommit = True
         cur = conn.cursor()
 
@@ -107,7 +135,11 @@ def create_gares_table():
 
         placeholders = ", ".join(["%s"] * len(headers))
         column_names = ", ".join([f'"{header}"' for header in headers])
-        insert_query = f"INSERT INTO gares ({column_names}) VALUES ({placeholders})"
+        insert_query = f"""
+        INSERT INTO gares ({column_names})
+        VALUES ({placeholders})
+        ON CONFLICT (code_uic) DO NOTHING;
+        """
         
         inserted_count = 0
         for row in data_rows:
@@ -122,57 +154,131 @@ def create_gares_table():
 
         cur.close()
         conn.close()
+        print("Finished create_gares_table.")
 
     except FileNotFoundError:
-        print(f"Error: CSV file not found at {csv_path}")
+        print(f"Error: CSV file not found at {gares_csv_path}")
     except psycopg2.Error as e:
         print(f"Error creating table: {e}")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
 def create_lignes_table():
-    load_dotenv('../.env')
-
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-
-    csv_lines_path = "./csv/lignes-par-type.csv"
-    csv_speed_path = "./csv/vitesse-maximale-nominale-sur-ligne.csv"
+    print("Starting create_lignes_table...")
+    conn = db_connect()
+    if not conn:
+        print("Failed to connect to database for create_lignes_table.")
+        return
 
     try:
-        with open(csv_lines_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig removes BOM
+        with open(tarifs_csv_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.reader(f, delimiter=';')
-            headers_lines_original = next(reader)
-            data_lines = list(reader)
+            headers = next(reader)
+            data_rows = list(reader)
+
+        # Find the indices for the relevant columns
+        try:
+            gare_origine_uic_index = headers.index('Gare origine - code UIC')
+            gare_destination_uic_index = headers.index('Gare destination - code UIC')
+        except ValueError as e:
+            print(f"Error: Missing expected column in CSV: {e}")
+            return
+
+        unique_lignes = set()
+        for row in data_rows:
+            if len(row) > max(gare_origine_uic_index, gare_destination_uic_index):
+                gare1_uic = row[gare_origine_uic_index]
+                gare2_uic = row[gare_destination_uic_index]
+                if gare1_uic and gare2_uic:
+                    # Store as a sorted tuple to ensure uniqueness regardless of order (A-B is same as B-A)
+                    unique_lignes.add(tuple(sorted((gare1_uic, gare2_uic))))
+
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS lignes (
+            id SERIAL PRIMARY KEY,
+            gare_origine_code_uic VARCHAR(10) NOT NULL,
+            gare_destination_code_uic VARCHAR(10) NOT NULL
+        )
+        """
+        cur.execute(create_table_query)
+        print("Table 'lignes' created successfully.")
+
+        insert_query = """
+        INSERT INTO lignes (gare_origine_code_uic, gare_destination_code_uic)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING;
+        """
         
-        with open(csv_speed_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig removes BOM
+        inserted_count = 0
+        for gare1_uic, gare2_uic in unique_lignes:
+            try:
+                cur.execute(insert_query, (gare1_uic, gare2_uic))
+                inserted_count += 1
+            except psycopg2.Error as e:
+                print(f"Error inserting ligne ({gare1_uic}, {gare2_uic}): {e}")
+                continue
+        
+        print(f"Inserted {inserted_count} unique lignes into 'lignes' table.")
+
+        cur.close()
+        conn.close()
+        print("Finished create_lignes_table.")
+
+    except FileNotFoundError:
+        print(f"Error: CSV file not found at {tarifs_csv_path}")
+    except psycopg2.Error as e:
+        print(f"Error creating or inserting into 'lignes' table: {e}")
+    except Exception as e:
+        print(f"Unexpected error in create_lignes_table: {e}")
+
+def create_troncons_table():
+    print("Starting create_troncons_table...")
+    conn = db_connect()
+    if not conn:
+        print("Failed to connect to database for create_troncons_table.")
+        return
+
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        cur.execute("DROP TABLE IF EXISTS troncons CASCADE;")
+        print("Dropped table 'troncons' if it existed.")
+
+        with open(troncons_csv_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig removes BOM
+            reader = csv.reader(f, delimiter=';')
+            headers_troncons_original = next(reader)
+            data_troncons = list(reader)
+        
+        with open(vitesse_csv_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig removes BOM
             reader = csv.reader(f, delimiter=';')
             headers_speed_original = next(reader)
             data_speed = list(reader)
         
-        headers_lines = [h.lower().strip().replace(' ', '_') for h in headers_lines_original]
+        headers_troncons = [h.lower().strip().replace(' ', '_') for h in headers_troncons_original]
         headers_speed = [h.lower().strip().replace(' ', '_') for h in headers_speed_original]
         
         columns_to_drop = ['x_d_l93', 'y_d_l93', 'x_f_l93', 'y_f_l93', 
                           'x_d_wgs84', 'y_d_wgs84', 'x_f_wgs84', 'y_f_wgs84',
                           'x_l93', 'y_l93', 'x_wgs84', 'y_wgs84']
         
-        drop_indices_lines = [i for i, h in enumerate(headers_lines) if h in columns_to_drop]
+        drop_indices_troncons = [i for i, h in enumerate(headers_troncons) if h in columns_to_drop]
         drop_indices_speed = [i for i, h in enumerate(headers_speed) if h in columns_to_drop]
         
-        if drop_indices_lines:
-            data_lines = [[val for i, val in enumerate(row) if i not in drop_indices_lines] 
-                         for row in data_lines]
+        if drop_indices_troncons:
+            data_troncons = [[val for i, val in enumerate(row) if i not in drop_indices_troncons] 
+                         for row in data_troncons]
         if drop_indices_speed:
             data_speed = [[val for i, val in enumerate(row) if i not in drop_indices_speed] 
                          for row in data_speed]
         
-        headers_lines = [h for h in headers_lines if h not in columns_to_drop]
+        headers_troncons = [h for h in headers_troncons if h not in columns_to_drop]
         headers_speed = [h for h in headers_speed if h not in columns_to_drop]
         
-        all_headers = headers_lines.copy()
+        all_headers = headers_troncons.copy()
         for header in headers_speed:
             if header not in all_headers:
                 all_headers.append(header)
@@ -181,37 +287,30 @@ def create_lignes_table():
         
         columns = ", ".join([f'"{header}" TEXT' for header in all_headers])
         
-        conn = psycopg2.connect(
-            user=db_user,
-            password=db_password,
-            host=db_host,
-            port=db_port,
-            database="sncf"
-        )
+        conn = db_connect()
+        if not conn:
+            return
         conn.autocommit = True
         cur = conn.cursor()
 
         create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS lignes (
+        CREATE TABLE IF NOT EXISTS troncons (
             id SERIAL PRIMARY KEY,
             {columns}
         )
         """
         
         cur.execute(create_table_query)
-        print("Table 'lignes' created successfully.")
+        print("Table 'troncons' created successfully.")
         print(f"Columns: {all_headers}")
-
-        cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_lignes_code_ligne ON lignes ("code_ligne")')
-        print("Unique index on 'code_ligne' created successfully.")
 
         merged_data = {}
         
         # Merge data from both CSVs
-        for row in data_lines:
-            if len(row) >= len(headers_lines):
-                key = f"{row[headers_lines.index('code_ligne')]}_{row[headers_lines.index('rg_troncon')]}_{row[headers_lines.index('pkd')]}_{row[headers_lines.index('pkf')]}"
-                merged_data[key] = dict(zip(headers_lines, row))
+        for row in data_troncons:
+            if len(row) >= len(headers_troncons):
+                key = f"{row[headers_troncons.index('code_ligne')]}_{row[headers_troncons.index('rg_troncon')]}_{row[headers_troncons.index('pkd')]}_{row[headers_troncons.index('pkf')]}"
+                merged_data[key] = dict(zip(headers_troncons, row))
         
         for row in data_speed:
             if len(row) >= len(headers_speed):
@@ -225,7 +324,7 @@ def create_lignes_table():
         
         placeholders = ", ".join(["%s"] * len(all_headers))
         column_names = ", ".join([f'"{header}"' for header in all_headers])
-        insert_query = f"INSERT INTO lignes ({column_names}) VALUES ({placeholders})"
+        insert_query = f"INSERT INTO troncons ({column_names}) VALUES ({placeholders})"
         
         inserted_count = 0
         for key, data_dict in merged_data.items():
@@ -237,154 +336,22 @@ def create_lignes_table():
                 print(f"Error inserting row: {e}")
                 continue
         
-        print(f"Inserted {inserted_count} rows into 'lignes' table.")
+        print(f"Inserted {inserted_count} rows into 'troncons' table.")
 
         cur.close()
         conn.close()
+        print("Finished create_troncons_table.")
 
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         print(f"Error: CSV file not found - {e}")
     except psycopg2.Error as e:
         print(f"Error creating table: {e}")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
-def haversine_distance(lon1, lat1, lon2, lat2):
-    """Calculate the great circle distance between two points on Earth (in kilometers)"""
-    # Convert decimal degrees to radians
-    lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
-    
-    # Haversine formula
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    r = 6371  # Radius of Earth in kilometers
-    
-    return c * r
-
-def calculate_line_distance(geo_shape):
-    """Calculate total distance of a line from its GeoJSON coordinates"""
-    try:
-        geo_data = json.loads(geo_shape)
-        coordinates = geo_data.get('coordinates', [])
-        
-        if len(coordinates) < 2:
-            return 0
-        
-        total_distance = 0
-        for i in range(len(coordinates) - 1):
-            lon1, lat1 = coordinates[i]
-            lon2, lat2 = coordinates[i + 1]
-            total_distance += haversine_distance(lon1, lat1, lon2, lat2)
-        
-        return total_distance
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return 0
-
-def calculate_travel_times():
-    load_dotenv('../.env')
-
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-
-    try:
-        conn = psycopg2.connect(
-            user=db_user,
-            password=db_password,
-            host=db_host,
-            port=db_port,
-            database="sncf"
-        )
-        cur = conn.cursor()
-
-        cur.execute('SELECT id, geo_shape, v_max FROM lignes WHERE geo_shape IS NOT NULL')
-        rows = cur.fetchall()
-        
-        updated_count = 0
-        for row in rows:
-            row_id, geo_shape, v_max = row
-            
-            if not geo_shape or not v_max:
-                continue
-            
-            try:
-                distance_km = calculate_line_distance(geo_shape)
-                
-                if distance_km == 0:
-                    continue
-                
-                speed_kmh = float(v_max)
-                
-                if speed_kmh == 0:
-                    continue
-                
-                time_hours = distance_km / speed_kmh
-                time_minutes = time_hours * 60
-                
-                cur.execute(
-                    'UPDATE lignes SET temps_trajet = %s WHERE id = %s',
-                    (str(time_minutes), row_id)
-                )
-                updated_count += 1
-                
-            except (ValueError, ZeroDivisionError) as e:
-                print(f"Error processing row {row_id}: {e}")
-                continue
-        
-        conn.commit()
-        print(f"Updated {updated_count} rows with calculated travel times.")
-        
-        cur.close()
-        conn.close()
-
-    except psycopg2.Error as e:
-        print(f"Database error: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-
-def add_foreign_key_constraint():
-    load_dotenv('../.env')
-
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-
-    try:
-        conn = psycopg2.connect(
-            user=db_user,
-            password=db_password,
-            host=db_host,
-            port=db_port,
-            database="sncf"
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
-
-        # foreign key
-        try:
-            cur.execute('''
-                ALTER TABLE gares 
-                ADD CONSTRAINT fk_gares_code_ligne 
-                FOREIGN KEY ("code_ligne") 
-                REFERENCES lignes ("code_ligne")
-            ''')
-            print("Foreign key constraint on 'code_ligne' created successfully.")
-        except psycopg2.Error as e:
-            print(f"Foreign key constraint already exists or error: {e}")
-
-        cur.close()
-        conn.close()
-
-    except psycopg2.Error as e:
-        print(f"Database error: {e}")
 
 if __name__ == "__main__":
     create_database()
-    create_lignes_table()
     create_gares_table()
-    add_foreign_key_constraint()
-    calculate_travel_times()
+    create_lignes_table()
+    create_troncons_table()
